@@ -1,0 +1,212 @@
+import "server-only";
+
+import { ANALYSIS_LOGIC_VERSION } from "@/lib/analysis-engine/materialize";
+import { selectBackfillCandidates } from "@/lib/backfill-analysis";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { INGEST_CONTRACT_VERSION } from "@/lib/ingest-contract";
+import {
+  listLatestPerformanceBaselines,
+  listLatestPipelineSloSnapshots,
+} from "@/lib/excellence/store";
+import type { ActionResult } from "@/types";
+
+// Not a Server Action: it reads platform-wide data with the service-role client.
+// Callers authorize first (super_admin page, cron-secret route).
+export async function getPlatformOperationsOverview(): Promise<
+  ActionResult<{
+    logicVersion: string;
+    ingestContractVersion: string;
+    latestBatchRuns: Array<{
+      id: string;
+      status: string;
+      processed: number;
+      succeeded: number;
+      failed: number;
+      createdAt: string;
+      finishedAt: string | null;
+      metadata: unknown;
+    }>;
+    latestNotifications: Array<{
+      id: string;
+      severity: string;
+      channel: string;
+      status: string;
+      alertCode: string;
+      createdAt: string;
+      recipient: string | null;
+    }>;
+    latestBackfillRuns: Array<{
+      id: string;
+      status: string;
+      selected: number;
+      processed: number;
+      succeeded: number;
+      failed: number;
+      createdAt: string;
+      finishedAt: string | null;
+      summary: unknown;
+    }>;
+    backfillCandidates: Array<{
+      campaignId: string;
+      campaignName: string;
+      reason: string;
+      latestLogicVersion: string | null;
+      hasSnapshot: boolean;
+    }>;
+    latestSloSnapshots: Array<{
+      id: string;
+      domain: string;
+      status: string;
+      successRate: number;
+      latencyMs: number;
+      snapshotDate: string;
+    }>;
+    latestPerformanceBaselines: Array<{
+      id: string;
+      scope: string;
+      metricKey: string;
+      observedAt: string;
+      summary: unknown;
+    }>;
+  }>
+> {
+  const supabase = createAdminClient();
+
+  const [
+    { data: campaigns, error: campaignsError },
+    { data: runs, error: runsError },
+    { data: snapshots, error: snapshotsError },
+    { data: batchRuns, error: batchRunsError },
+    { data: notifications, error: notificationsError },
+    backfillRunsResult,
+    sloSnapshots,
+    performanceBaselines,
+  ] = await Promise.all([
+    supabase.from("campaigns").select("id, name, status").in("status", ["closed", "archived"]),
+    supabase
+      .from("analysis_runs")
+      .select("campaign_id, logic_version, completed_at, status")
+      .eq("status", "completed")
+      .order("completed_at", { ascending: false })
+      .limit(200),
+    supabase.from("analysis_run_snapshots").select("campaign_id, analysis_run_id").limit(200),
+    supabase
+      .from("batch_job_runs")
+      .select("id, status, processed, succeeded, failed, created_at, finished_at, metadata")
+      .order("created_at", { ascending: false })
+      .limit(10),
+    supabase
+      .from("pipeline_notifications")
+      .select("id, severity, channel, status, alert_code, created_at, recipient")
+      .order("created_at", { ascending: false })
+      .limit(20),
+    supabase
+      .from("backfill_run_metrics")
+      .select(
+        "id, status, selected, processed, succeeded, failed, created_at, finished_at, summary"
+      )
+      .order("created_at", { ascending: false })
+      .limit(10),
+    listLatestPipelineSloSnapshots(20),
+    listLatestPerformanceBaselines(20),
+  ]);
+
+  const firstError =
+    campaignsError ??
+    runsError ??
+    snapshotsError ??
+    batchRunsError ??
+    notificationsError ??
+    backfillRunsResult.error;
+  if (firstError) {
+    return { success: false, error: firstError.message };
+  }
+
+  const latestRunByCampaign = new Map<
+    string,
+    { logicVersion: string | null; completedAt: string | null }
+  >();
+  for (const run of runs ?? []) {
+    if (!latestRunByCampaign.has(run.campaign_id)) {
+      latestRunByCampaign.set(run.campaign_id, {
+        logicVersion: run.logic_version,
+        completedAt: run.completed_at,
+      });
+    }
+  }
+
+  const snapshotCampaigns = new Set((snapshots ?? []).map((snapshot) => snapshot.campaign_id));
+  const backfillCandidates = selectBackfillCandidates(
+    (campaigns ?? []).map((campaign) => ({
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      campaignStatus: campaign.status,
+      latestLogicVersion: latestRunByCampaign.get(campaign.id)?.logicVersion ?? null,
+      latestCompletedAt: latestRunByCampaign.get(campaign.id)?.completedAt ?? null,
+      hasSnapshot: snapshotCampaigns.has(campaign.id),
+    })),
+    { limit: 10, targetLogicVersion: ANALYSIS_LOGIC_VERSION }
+  );
+
+  return {
+    success: true,
+    data: {
+      logicVersion: ANALYSIS_LOGIC_VERSION,
+      ingestContractVersion: INGEST_CONTRACT_VERSION,
+      latestBatchRuns: (batchRuns ?? []).map((run) => ({
+        id: run.id,
+        status: run.status,
+        processed: run.processed,
+        succeeded: run.succeeded,
+        failed: run.failed,
+        createdAt: run.created_at,
+        finishedAt: run.finished_at,
+        metadata: run.metadata,
+      })),
+      latestNotifications: (notifications ?? []).map((notification) => ({
+        id: notification.id,
+        severity: notification.severity,
+        channel: notification.channel,
+        status: notification.status,
+        alertCode: notification.alert_code,
+        createdAt: notification.created_at,
+        recipient: notification.recipient,
+      })),
+      latestBackfillRuns: ((backfillRunsResult.data ?? []) as Array<Record<string, unknown>>).map(
+        (run) => ({
+          id: String(run.id),
+          status: String(run.status),
+          selected: Number(run.selected ?? 0),
+          processed: Number(run.processed ?? 0),
+          succeeded: Number(run.succeeded ?? 0),
+          failed: Number(run.failed ?? 0),
+          createdAt: String(run.created_at),
+          finishedAt: (run.finished_at as string | null) ?? null,
+          summary: run.summary ?? {},
+        })
+      ),
+      backfillCandidates: backfillCandidates.map((candidate) => ({
+        campaignId: candidate.campaignId,
+        campaignName: candidate.campaignName,
+        reason: candidate.reason,
+        latestLogicVersion: candidate.latestLogicVersion,
+        hasSnapshot: candidate.hasSnapshot,
+      })),
+      latestSloSnapshots: sloSnapshots.map((snapshot) => ({
+        id: snapshot.id,
+        domain: snapshot.domain,
+        status: snapshot.status,
+        successRate: Number(snapshot.observed_success_rate ?? 0),
+        latencyMs: Number(snapshot.observed_latency_ms ?? 0),
+        snapshotDate: snapshot.snapshot_date,
+      })),
+      latestPerformanceBaselines: performanceBaselines.map((baseline) => ({
+        id: baseline.id,
+        scope: baseline.scope,
+        metricKey: baseline.metric_key,
+        observedAt: baseline.observed_at,
+        summary: baseline.summary,
+      })),
+    },
+  };
+}

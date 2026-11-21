@@ -1,0 +1,85 @@
+name: Update behind PRs
+
+# El ruleset exige la rama al día (`strict`): cada merge a la rama principal deja BEHIND a los
+# demás PRs y GitHub no actualiza ramas solo, así que un PR con auto-merge activado se queda
+# varado hasta que alguien lo actualice a mano. Tras cada push a la rama principal, este workflow
+# actualiza la rama de UN PR con auto-merge: el más antiguo cuyos checks requeridos no estén en
+# rojo. Uno a la vez, porque `strict` solo deja fusionar al que está al día; cuando ese se
+# fusiona, su push vuelve a disparar este workflow y sigue el siguiente. Un PR con checks rojos
+# se salta (de él se ocupan ci-auto-fix o una persona). Merge queue haría esto mejor, pero no
+# existe en repos privados del plan Pro.
+#
+# Dos tokens: las lecturas van con GITHUB_TOKEN, porque el PAT fino de automatización no puede
+# leer los checks de un PR (statusCheckRollup); el `update-branch` va con el PAT, porque una rama
+# actualizada con GITHUB_TOKEN no dispara el CI del PR.
+on:
+  push:
+    branches: [main, master]
+  # Dependabot abre sus PRs en lote justo después de un merge y con base vieja: el push que los
+  # habría actualizado ocurrió antes de que existieran. Cuando `dependabot-auto-merge.yml` termina
+  # de activarles el auto-merge, hay que mover la cola aunque no haya habido push.
+  workflow_run:
+    workflows: ["Dependabot auto-merge"]
+    types: [completed]
+  # Recuperación: si el push no generó corrida (pasó en el incidente de Actions del 2026-11-05),
+  # `gh workflow run update-behind.yml` vuelve a mover la cola.
+  workflow_dispatch:
+  # Vigilante: si un evento se perdió o un candidato quedó saltado en silencio, la cola se mueve
+  # sola cada seis horas sin que nadie lo note. En `schedule`, `GITHUB_REF_NAME` es la rama por
+  # defecto, así que el paso corre igual que tras un push.
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: update-behind-prs
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  update:
+    # workflow_run corre siempre sobre la rama principal; solo interesa cuando el job de Dependabot
+    # corrió de verdad (en PRs ajenos a Dependabot termina en `skipped`).
+    if: >-
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Actualizar el PR con auto-merge más antiguo que siga sano
+        run: |
+          set -u
+          candidates="$(gh pr list --state open --base "$GITHUB_REF_NAME" --limit 100 \
+            --json number,createdAt,autoMergeRequest \
+            --jq '[.[] | select(.autoMergeRequest != null)] | sort_by(.createdAt) | .[].number')"
+          if [ -z "$candidates" ]; then echo "Sin PRs con auto-merge pendientes."; exit 0; fi
+          # Los checks requeridos salen de las reglas de la rama base (las lee cualquier token).
+          # Actions corre el paso con `bash -e`: el `|| rc=$?` evita que un rc distinto de 0
+          # termine el paso antes de decidir.
+          rc=0; required="$(gh api "repos/$GH_REPO/rules/branches/$GITHUB_REF_NAME" \
+            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | unique | .[]')" || rc=$?
+          [ "$rc" -eq 0 ] || echo "::warning::No pude leer las reglas de $GITHUB_REF_NAME (rc=$rc): ningún candidato se salta por checks rojos"
+          for n in $candidates; do
+            # Con --json, gh pr checks sale con 0; bucket: pass | fail | pending | skipping | cancel.
+            # Rojo = un check requerido en `fail`. Pendiente o sin reportar no es rojo: decide el CI.
+            red="$(gh pr checks "$n" --json name,bucket 2>/dev/null \
+              | jq -r --arg req "$required" '[.[] | select(.bucket == "fail") | select(.name as $c | ($req | split("\n") | index($c)) != null) | .name] | join(", ")' || true)"
+            if [ -n "$red" ]; then echo "#$n: checks requeridos en rojo ($red), lo salto"; continue; fi
+            if out="$(GH_TOKEN="$AUTOMATION_TOKEN" gh api -X PUT "repos/$GH_REPO/pulls/$n/update-branch" 2>&1)"; then
+              echo "#$n: rama actualizada; el CI decide el merge"; exit 0
+            fi
+            case "$out" in
+              *"no new commits"*) echo "#$n: ya está al día, en vuelo"; exit 0 ;;
+              *) echo "::warning::#$n: no se pudo actualizar: $out" ;;
+            esac
+          done
+          echo "Ningún PR con auto-merge quedó actualizable."

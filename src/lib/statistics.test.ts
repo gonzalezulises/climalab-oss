@@ -1,0 +1,221 @@
+import { describe, it, expect } from "vitest";
+import {
+  mean,
+  stdDev,
+  favorability,
+  rwg,
+  cronbachAlpha,
+  pearson,
+  welchTTest,
+  welchTTestFromStats,
+} from "./statistics";
+
+describe("mean", () => {
+  it("returns the single value for a single-element array", () => {
+    expect(mean([5])).toBe(5);
+  });
+
+  it("returns correct mean for an even distribution", () => {
+    expect(mean([1, 2, 3, 4, 5])).toBe(3);
+  });
+
+  it("returns the value when all elements are identical", () => {
+    expect(mean([3, 3, 3, 3])).toBe(3);
+  });
+});
+
+describe("stdDev", () => {
+  it("returns 0 for a single value", () => {
+    expect(stdDev([5])).toBe(0);
+  });
+
+  it("returns 0 when there is no variation", () => {
+    expect(stdDev([4, 4, 4, 4])).toBe(0);
+  });
+
+  it("returns correct sample std dev for a known case", () => {
+    // [2, 4, 4, 4, 5, 5, 7, 9] → mean=5, sample variance=32/7≈4.571, stddev≈2.138
+    const result = stdDev([2, 4, 4, 4, 5, 5, 7, 9]);
+    expect(result).toBeCloseTo(2.138, 2);
+  });
+});
+
+describe("favorability", () => {
+  it("returns 100 when all scores are favorable (>=4)", () => {
+    expect(favorability([4, 5, 4, 5])).toBe(100);
+  });
+
+  it("returns 0 when no scores are favorable", () => {
+    expect(favorability([1, 2, 3, 3])).toBe(0);
+  });
+
+  it("treats score of 4 as favorable (boundary)", () => {
+    expect(favorability([3, 4])).toBe(50);
+  });
+});
+
+describe("rwg", () => {
+  it("returns null if fewer than 3 scores", () => {
+    expect(rwg([4, 4])).toBeNull();
+  });
+
+  it("returns 1.0 for perfect agreement", () => {
+    expect(rwg([4, 4, 4, 4, 4])).toBe(1);
+  });
+
+  it("clamps to 0 for maximum disagreement", () => {
+    // scores [1, 5, 1, 5, 1, 5] → high variance
+    const result = rwg([1, 5, 1, 5, 1, 5]);
+    expect(result).toBeGreaterThanOrEqual(0);
+  });
+
+  it("returns low rwg for uniformly spread scores", () => {
+    // Full range 1-5 repeated → high variance → low agreement
+    const result = rwg([1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+    expect(result).not.toBeNull();
+    expect(result!).toBeLessThan(0.3);
+  });
+
+  it("rounds to 3 decimal places", () => {
+    const result = rwg([3, 3, 4, 3, 4, 3, 4]);
+    expect(result).not.toBeNull();
+    const str = result!.toString();
+    const decimals = str.includes(".") ? str.split(".")[1].length : 0;
+    expect(decimals).toBeLessThanOrEqual(3);
+  });
+});
+
+describe("cronbachAlpha", () => {
+  it("returns insufficient_items if k < 2", () => {
+    const matrix = Array.from({ length: 10 }, () => [3]);
+    const result = cronbachAlpha(matrix);
+    expect(result.status).toBe("insufficient_items");
+    expect(result.value).toBeNull();
+  });
+
+  it("returns insufficient_n if n < 10", () => {
+    const matrix = Array.from({ length: 9 }, () => [3, 4]);
+    const result = cronbachAlpha(matrix);
+    expect(result.status).toBe("insufficient_n");
+    expect(result.value).toBeNull();
+  });
+
+  it("returns zero_variance if totalVar is 0", () => {
+    // All identical rows → total variance = 0
+    const matrix = Array.from({ length: 10 }, () => [3, 4, 5]);
+    const result = cronbachAlpha(matrix);
+    expect(result.status).toBe("zero_variance");
+    expect(result.value).toBeNull();
+  });
+
+  it("returns high alpha for a reliable matrix", () => {
+    // Build a matrix where items correlate well (simulate reliable scale)
+    const matrix: number[][] = [];
+    for (let i = 0; i < 20; i++) {
+      const base = 2 + (i % 4); // varies 2-5
+      matrix.push([base, base, base + (i % 2 === 0 ? 0 : 1)]);
+    }
+    const result = cronbachAlpha(matrix);
+    expect(result.status).toBe("calculated");
+    expect(result.value).not.toBeNull();
+    expect(result.value!).toBeGreaterThan(0.6);
+  });
+
+  it("returns low or negative alpha for incoherent matrix", () => {
+    // Items that don't correlate — alternating pattern breaks consistency
+    const matrix: number[][] = [];
+    for (let i = 0; i < 20; i++) {
+      matrix.push([1 + (i % 5), 5 - (i % 5), 1 + ((i * 3) % 5)]);
+    }
+    const result = cronbachAlpha(matrix);
+    expect(result.status).toBe("calculated");
+    expect(result.value).not.toBeNull();
+    expect(result.value!).toBeLessThan(0.3);
+  });
+
+  it("rounds to 3 decimal places", () => {
+    const matrix: number[][] = [];
+    for (let i = 0; i < 20; i++) {
+      const base = 1 + (i % 5);
+      matrix.push([base, base + (i % 3), base + (i % 2)]);
+    }
+    const result = cronbachAlpha(matrix);
+    if (result.value !== null) {
+      const str = result.value.toString();
+      const decimals = str.includes(".") ? str.split(".")[1].length : 0;
+      expect(decimals).toBeLessThanOrEqual(3);
+    }
+  });
+});
+
+describe("pearson", () => {
+  it("returns r=0 and pValue=1 if n < 10", () => {
+    const result = pearson([1, 2, 3], [1, 2, 3]);
+    expect(result.r).toBe(0);
+    expect(result.pValue).toBe(1);
+    expect(result.n).toBe(3);
+  });
+
+  it("returns r close to 1 for perfect positive correlation", () => {
+    const x = Array.from({ length: 20 }, (_, i) => i + 1);
+    const y = Array.from({ length: 20 }, (_, i) => i + 1);
+    const result = pearson(x, y);
+    expect(result.r).toBe(1);
+  });
+
+  it("returns r close to -1 for perfect negative correlation", () => {
+    const x = Array.from({ length: 20 }, (_, i) => i + 1);
+    const y = Array.from({ length: 20 }, (_, i) => 20 - i);
+    const result = pearson(x, y);
+    expect(result.r).toBe(-1);
+  });
+
+  it("returns r near 0 for uncorrelated data", () => {
+    // Sine vs linear — no linear correlation
+    const x = Array.from({ length: 20 }, (_, i) => i + 1);
+    const y = Array.from({ length: 20 }, (_, i) => Math.sin(i * 1.5) * 10);
+    const result = pearson(x, y);
+    expect(Math.abs(result.r)).toBeLessThan(0.5);
+  });
+
+  it("returns r=0 and pValue=1 for zero denominator", () => {
+    // All same values → zero variance → zero denominator
+    const x = Array.from({ length: 20 }, () => 3);
+    const y = Array.from({ length: 20 }, (_, i) => i);
+    const result = pearson(x, y);
+    expect(result.r).toBe(0);
+    expect(result.pValue).toBe(1);
+  });
+});
+
+describe("welchTTestFromStats", () => {
+  it("matches welchTTest with equivalent aggregate inputs", () => {
+    const group1 = [2.1, 2.3, 2.5, 2.2, 2.4, 2.6, 2.0, 2.3, 2.1, 2.5, 2.2, 2.4, 2.3, 2.5, 2.1];
+    const group2 = [4.1, 4.3, 4.5, 4.2, 4.4, 4.6, 4.0, 4.3, 4.1, 4.5, 4.2, 4.4, 4.3, 4.5, 4.1];
+    const fromRaw = welchTTest(group1, group2);
+    const fromStats = welchTTestFromStats(
+      mean(group1),
+      stdDev(group1),
+      group1.length,
+      mean(group2),
+      stdDev(group2),
+      group2.length
+    );
+    expect(fromStats).not.toBeNull();
+    expect(fromStats!.t).toBe(fromRaw!.t);
+    expect(fromStats!.df).toBe(fromRaw!.df);
+    expect(fromStats!.pValue).toBe(fromRaw!.pValue);
+  });
+
+  it("returns null when n is below threshold", () => {
+    const result = welchTTestFromStats(3.0, 0.5, 5, 4.0, 0.5, 5);
+    expect(result).toBeNull();
+  });
+
+  it("handles zero standard deviation", () => {
+    const result = welchTTestFromStats(3.0, 0, 20, 3.0, 0, 20);
+    expect(result).not.toBeNull();
+    expect(result!.t).toBe(0);
+    expect(result!.significant).toBe(false);
+  });
+});
