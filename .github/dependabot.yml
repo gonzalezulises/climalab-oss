@@ -1,0 +1,57 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # Siete días de madurez antes de proponer una versión (regla de parche-flota).
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    ignore:
+      # TypeScript 7 (compilador nativo) compila con Next.js 16.3+, pero typescript-eslint, que
+      # trae eslint-config-next, solo admite <6.1 (typescript-eslint/typescript-eslint#12518).
+      # Quitar cuando lo soporte; mientras, Dependabot propone 6.x.
+      - dependency-name: typescript
+        versions: [">=7"]
+      # /node sigue al runtime de Vercel (24.x), no al último Node publicado.
+      - dependency-name: "@types/node"
+        versions: [">=25"]
+    groups:
+      # Las actualizaciones de seguridad llegan en un solo PR por tanda, no una por vulnerabilidad:
+      # cada PR suelto construía su propio preview en Vercel.
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+      # Familias que se mueven juntas van antes de `patches` y `dev-dependencies`: cuando una
+      # dependencia encaja en varios grupos, Dependabot aplica el primero que la contiene. Un PR por
+      # familia = un solo arreglo de código cuando el bump lo exige (dos PRs sueltos de la misma
+      # familia produjeron dos arreglos distintos del mismo tipado y un conflicto que Dependabot no
+      # rebasea: climalab #72/#73, 2026-11-05).
+      vitest:
+        patterns: [vitest, "@vitest/*"]
+      supabase:
+        patterns: [supabase, "@supabase/*"]
+      sentry:
+        patterns: ["@sentry/*"]
+      react:
+        patterns: [react, react-dom, "@types/react", "@types/react-dom"]
+      next:
+        patterns: [next, "@next/*", eslint-config-next]
+      eslint:
+        patterns: [eslint, "@eslint/*", typescript-eslint, "@typescript-eslint/*", "eslint-plugin-*"]
+      patches:
+        update-types: ["patch"]
+      dev-dependencies:
+        dependency-type: development
+        update-types: ["minor", "patch"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      # Un PR mensual con todas las acciones, no cinco sueltos. Los fusiona una persona:
+      # el auto-merge solo cubre npm.
+      actions:
+        patterns: ["*"]

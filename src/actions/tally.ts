@@ -1,0 +1,524 @@
+"use server";
+
+import { createClient } from "@/lib/supabase/server";
+import { env } from "@/lib/env";
+import type { ActionResult } from "@/types";
+import { randomUUID } from "crypto";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+type TallyBlock = {
+  uuid: string;
+  type: string;
+  groupUuid: string;
+  groupType: string;
+  payload?: Record<string, unknown>;
+};
+
+type FieldMapping = {
+  tally_field_key: string;
+  target_type: "item" | "demographic" | "open_response" | "enps";
+  target_id: string | null;
+  target_meta: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const TALLY_API = "https://api.tally.so";
+
+const TENURE_OPTIONS = [
+  { label: "Menos de 1 año", value: "<1" },
+  { label: "1-3 años", value: "1-3" },
+  { label: "3-5 años", value: "3-5" },
+  { label: "5-10 años", value: "5-10" },
+  { label: "Más de 10 años", value: "10+" },
+];
+
+const GENDER_OPTIONS = [
+  { label: "Femenino", value: "female" },
+  { label: "Masculino", value: "male" },
+  { label: "Otro", value: "other" },
+  { label: "Prefiero no decir", value: "prefer_not_to_say" },
+];
+
+const LIKERT_LABELS: Record<number, string> = {
+  1: "Totalmente en desacuerdo",
+  2: "En desacuerdo",
+  3: "Ni acuerdo ni desacuerdo",
+  4: "De acuerdo",
+  5: "Totalmente de acuerdo",
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function uuid() {
+  return randomUUID();
+}
+
+function makePageGroup() {
+  return uuid();
+}
+
+// --- Block helpers (based on working clickleads implementation) ---
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formTitleBlock(groupUuid: string, title: string): TallyBlock {
+  return {
+    uuid: uuid(),
+    type: "FORM_TITLE",
+    groupUuid,
+    groupType: "FORM_TITLE",
+    payload: { html: `<p>${escapeHtml(title)}</p>` },
+  };
+}
+
+function sectionTitleBlock(text: string): TallyBlock {
+  const groupUuid = uuid();
+  return {
+    uuid: uuid(),
+    type: "TITLE",
+    groupUuid,
+    groupType: "TITLE",
+    payload: { html: `<p>${escapeHtml(text)}</p>` },
+  };
+}
+
+// MULTIPLE_CHOICE: TITLE + N MULTIPLE_CHOICE_OPTION blocks (same groupUuid)
+function multipleChoiceQuestion(
+  label: string,
+  options: string[],
+  required: boolean
+): { blocks: TallyBlock[]; fieldKey: string } {
+  const groupUuid = uuid();
+  const blocks: TallyBlock[] = [];
+
+  blocks.push({
+    uuid: uuid(),
+    type: "TITLE",
+    groupUuid,
+    groupType: "QUESTION",
+    payload: { html: `<p>${escapeHtml(label)}</p>` },
+  });
+
+  for (let i = 0; i < options.length; i++) {
+    blocks.push({
+      uuid: uuid(),
+      type: "MULTIPLE_CHOICE_OPTION",
+      groupUuid,
+      groupType: "MULTIPLE_CHOICE",
+      payload: {
+        text: options[i],
+        index: i,
+        isFirst: i === 0,
+        isLast: i === options.length - 1,
+        ...(i === 0 && { isRequired: required }),
+      },
+    });
+  }
+
+  return { blocks, fieldKey: groupUuid };
+}
+
+// LINEAR_SCALE: TITLE + LINEAR_SCALE (same groupUuid)
+function linearScaleQuestion(
+  label: string,
+  start: number,
+  end: number,
+  leftLabel?: string,
+  rightLabel?: string
+): { blocks: TallyBlock[]; fieldKey: string } {
+  const groupUuid = uuid();
+  const fieldKey = uuid();
+  return {
+    fieldKey,
+    blocks: [
+      {
+        uuid: uuid(),
+        type: "TITLE",
+        groupUuid,
+        groupType: "QUESTION",
+        payload: { html: `<p>${escapeHtml(label)}</p>` },
+      },
+      {
+        uuid: fieldKey,
+        type: "LINEAR_SCALE",
+        groupUuid,
+        groupType: "LINEAR_SCALE",
+        payload: {
+          isRequired: true,
+          start,
+          end,
+          step: 1,
+          hasLeftLabel: !!leftLabel,
+          leftLabel: leftLabel || "",
+          hasRightLabel: !!rightLabel,
+          rightLabel: rightLabel || "",
+        },
+      },
+    ],
+  };
+}
+
+// TEXTAREA: TITLE + TEXTAREA (same groupUuid)
+function textareaQuestion(
+  label: string,
+  required: boolean
+): { blocks: TallyBlock[]; fieldKey: string } {
+  const groupUuid = uuid();
+  const fieldKey = uuid();
+  return {
+    fieldKey,
+    blocks: [
+      {
+        uuid: uuid(),
+        type: "TITLE",
+        groupUuid,
+        groupType: "QUESTION",
+        payload: { html: `<p>${escapeHtml(label)}</p>` },
+      },
+      {
+        uuid: fieldKey,
+        type: "TEXTAREA",
+        groupUuid,
+        groupType: "TEXTAREA",
+        payload: { isRequired: required },
+      },
+    ],
+  };
+}
+
+function hiddenFieldBlock(
+  groupUuid: string,
+  fieldName: string
+): { block: TallyBlock; fieldKey: string } {
+  const fieldKey = uuid();
+  return {
+    fieldKey,
+    block: {
+      uuid: fieldKey,
+      type: "HIDDEN_FIELDS",
+      groupUuid,
+      groupType: "HIDDEN_FIELDS",
+      payload: { hiddenFields: [{ uuid: uuid(), name: fieldName }] },
+    },
+  };
+}
+
+function pageBreakBlock(): TallyBlock {
+  return {
+    uuid: uuid(),
+    type: "PAGE_BREAK",
+    groupUuid: uuid(),
+    groupType: "PAGE_BREAK",
+    payload: {},
+  };
+}
+
+// ---------------------------------------------------------------------------
+// createTallyForm — generates a Tally form for a campaign
+// ---------------------------------------------------------------------------
+export async function createTallyForm(
+  campaignId: string
+): Promise<ActionResult<{ formUrl: string; formId: string }>> {
+  const apiKey = env.TALLY_API_KEY;
+  if (!apiKey) {
+    return { success: false, error: "TALLY_API_KEY no configurada" };
+  }
+
+  const supabase = await createClient();
+
+  // Check if form already exists
+  const { data: existingMapping } = await supabase
+    .from("tally_form_mappings")
+    .select("tally_form_url, tally_form_id")
+    .eq("campaign_id", campaignId)
+    .limit(1)
+    .maybeSingle();
+
+  if (existingMapping) {
+    return {
+      success: true,
+      data: { formUrl: existingMapping.tally_form_url, formId: existingMapping.tally_form_id },
+    };
+  }
+
+  // Load campaign + org + instrument
+  const { data: campaign } = await supabase
+    .from("campaigns")
+    .select("*, organizations(name, departments, brand_config)")
+    .eq("id", campaignId)
+    .single();
+
+  if (!campaign) {
+    return { success: false, error: "Campaña no encontrada" };
+  }
+
+  const org = campaign.organizations as unknown as {
+    name: string;
+    departments: Array<{ name: string; headcount: number | null }> | null;
+    brand_config: Record<string, unknown> | null;
+  } | null;
+
+  // Load dimensions + items for base instrument + modules
+  const allInstrumentIds = [campaign.instrument_id, ...(campaign.module_instrument_ids ?? [])];
+  const { data: dimensions } = await supabase
+    .from("dimensions")
+    .select("*, items(*)")
+    .in("instrument_id", allInstrumentIds)
+    .order("sort_order", { ascending: true });
+
+  if (!dimensions || dimensions.length === 0) {
+    return { success: false, error: "No se encontraron dimensiones para el instrumento" };
+  }
+
+  // Build form blocks and collect mappings
+  const blocks: TallyBlock[] = [];
+  const mappings: FieldMapping[] = [];
+
+  // --- Page 1: Welcome + Demographics ---
+  const welcomeGroup = makePageGroup();
+
+  blocks.push(
+    formTitleBlock(welcomeGroup, `Encuesta de Clima Organizacional — ${org?.name ?? ""}`)
+  );
+
+  // Hidden field: campaign_id
+  const hiddenCampaign = hiddenFieldBlock(welcomeGroup, "campaign_id");
+  blocks.push(hiddenCampaign.block);
+
+  // Department
+  const targetDepts = (campaign as { target_departments?: string[] | null }).target_departments;
+  const allDeptNames = (org?.departments ?? []).map((d) => d.name);
+  const deptOptions =
+    targetDepts && targetDepts.length > 0
+      ? allDeptNames.filter((name) => targetDepts.includes(name))
+      : allDeptNames;
+
+  if (deptOptions.length > 0) {
+    const dept = multipleChoiceQuestion("¿A qué departamento perteneces?", deptOptions, true);
+    blocks.push(...dept.blocks);
+    mappings.push({
+      tally_field_key: dept.fieldKey,
+      target_type: "demographic",
+      target_id: null,
+      target_meta: "department",
+    });
+  }
+
+  const tenure = multipleChoiceQuestion(
+    "¿Cuánto tiempo llevas en la organización?",
+    TENURE_OPTIONS.map((o) => o.label),
+    true
+  );
+  blocks.push(...tenure.blocks);
+  mappings.push({
+    tally_field_key: tenure.fieldKey,
+    target_type: "demographic",
+    target_id: null,
+    target_meta: "tenure",
+  });
+
+  const gender = multipleChoiceQuestion(
+    "Género",
+    GENDER_OPTIONS.map((o) => o.label),
+    true
+  );
+  blocks.push(...gender.blocks);
+  mappings.push({
+    tally_field_key: gender.fieldKey,
+    target_type: "demographic",
+    target_id: null,
+    target_meta: "gender",
+  });
+
+  blocks.push(pageBreakBlock());
+
+  // --- Pages 2-N: Dimensions ---
+  for (const dim of dimensions) {
+    blocks.push(sectionTitleBlock(dim.name));
+
+    const sortedItems = [...dim.items].sort((a, b) => a.sort_order - b.sort_order);
+
+    for (const item of sortedItems) {
+      const ls = linearScaleQuestion(item.text, 1, 5, LIKERT_LABELS[1], LIKERT_LABELS[5]);
+      blocks.push(...ls.blocks);
+      mappings.push({
+        tally_field_key: ls.fieldKey,
+        target_type: "item",
+        target_id: item.id,
+        target_meta: null,
+      });
+    }
+
+    blocks.push(pageBreakBlock());
+  }
+
+  // --- Final Page: Open questions + eNPS ---
+  blocks.push(sectionTitleBlock("Preguntas abiertas"));
+
+  const q1 = textareaQuestion(
+    "¿Cuál consideras que es la mayor fortaleza de la organización?",
+    false
+  );
+  blocks.push(...q1.blocks);
+  mappings.push({
+    tally_field_key: q1.fieldKey,
+    target_type: "open_response",
+    target_id: null,
+    target_meta: "strength",
+  });
+
+  const q2 = textareaQuestion(
+    "¿Qué aspecto consideras que la organización debería mejorar?",
+    false
+  );
+  blocks.push(...q2.blocks);
+  mappings.push({
+    tally_field_key: q2.fieldKey,
+    target_type: "open_response",
+    target_id: null,
+    target_meta: "improvement",
+  });
+
+  const q3 = textareaQuestion("¿Hay algo más que quieras compartir?", false);
+  blocks.push(...q3.blocks);
+  mappings.push({
+    tally_field_key: q3.fieldKey,
+    target_type: "open_response",
+    target_id: null,
+    target_meta: "general",
+  });
+
+  const enps = linearScaleQuestion(
+    "En una escala de 0 a 10, ¿qué tan probable es que recomiendes esta organización como un lugar para trabajar?",
+    0,
+    10,
+    "Nada probable",
+    "Muy probable"
+  );
+  blocks.push(...enps.blocks);
+  mappings.push({
+    tally_field_key: enps.fieldKey,
+    target_type: "enps",
+    target_id: null,
+    target_meta: null,
+  });
+
+  // --- Build theme from brand_config ---
+  const brandConfig = org?.brand_config as Record<string, string> | null;
+  const settings: Record<string, unknown> = {
+    language: "es",
+    redirectUrl: `${env.NEXT_PUBLIC_SITE_URL}/survey/thanks`,
+  };
+
+  if (brandConfig) {
+    settings.theme = {
+      ...(brandConfig.primaryColor && { accent: brandConfig.primaryColor }),
+      ...(brandConfig.primaryColor && { button: brandConfig.primaryColor }),
+    };
+  }
+
+  // --- Create form in Tally ---
+  const createRes = await fetch(`${TALLY_API}/forms`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      status: "PUBLISHED",
+      blocks,
+      settings,
+    }),
+  });
+
+  if (!createRes.ok) {
+    const body = await createRes.text().catch(() => "");
+    return {
+      success: false,
+      error: `Error creando formulario en Tally (${createRes.status}): ${body.slice(0, 300)}`,
+    };
+  }
+
+  const formData = await createRes.json();
+  const formId: string = formData.id;
+  const formUrl = `https://tally.so/r/${formId}`;
+
+  // --- Configure webhook ---
+  const webhookSecret = env.TALLY_WEBHOOK_SECRET ?? randomUUID();
+  const webhookUrl = `${env.NEXT_PUBLIC_SITE_URL}/api/webhooks/tally`;
+
+  const webhookRes = await fetch(`${TALLY_API}/webhooks`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      formId,
+      url: webhookUrl,
+      eventTypes: ["FORM_RESPONSE"],
+      signingSecret: webhookSecret,
+    }),
+  });
+
+  if (!webhookRes.ok) {
+    const body = await webhookRes.text().catch(() => "");
+    console.error("Failed to create Tally webhook:", body);
+    // Don't fail — form was created, webhook can be configured manually
+  }
+
+  // --- Save mappings ---
+  const mappingRows = mappings.map((m) => ({
+    campaign_id: campaignId,
+    tally_form_id: formId,
+    tally_form_url: formUrl,
+    tally_field_key: m.tally_field_key,
+    target_type: m.target_type,
+    target_id: m.target_id,
+    target_meta: m.target_meta,
+  }));
+
+  const { error: insertError } = await supabase.from("tally_form_mappings").insert(mappingRows);
+
+  if (insertError) {
+    return { success: false, error: `Error guardando mappings: ${insertError.message}` };
+  }
+
+  return { success: true, data: { formUrl, formId } };
+}
+
+// ---------------------------------------------------------------------------
+// getTallyFormUrl — retrieve form URL for a campaign
+// ---------------------------------------------------------------------------
+export async function getTallyFormUrl(
+  campaignId: string
+): Promise<ActionResult<{ formUrl: string; formId: string } | null>> {
+  const supabase = await createClient();
+
+  const { data } = await supabase
+    .from("tally_form_mappings")
+    .select("tally_form_url, tally_form_id")
+    .eq("campaign_id", campaignId)
+    .limit(1)
+    .maybeSingle();
+
+  if (!data) {
+    return { success: true, data: null };
+  }
+
+  return {
+    success: true,
+    data: { formUrl: data.tally_form_url, formId: data.tally_form_id },
+  };
+}

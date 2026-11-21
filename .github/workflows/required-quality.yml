@@ -1,0 +1,29 @@
+# Required quality — typecheck, tests y build en cada PR (make check).
+# El ruleset `required-quality-check` exige este nombre de job: no lo cambies sin cambiar el ruleset.
+name: Required quality
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: required-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  required-quality:
+    name: Required quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: make check

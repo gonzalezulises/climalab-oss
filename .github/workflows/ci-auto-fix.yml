@@ -1,0 +1,104 @@
+name: CI auto-fix
+
+# CI rojo en un PR → Claude lee los logs, corrige la causa raíz, corre `make check` y
+# empuja `fix(ci): …` a la misma rama. Guardias contra bucles: una etiqueta por PR
+# (un solo intento) y nunca sobre un commit que ya sea `fix(ci)`.
+on:
+  workflow_run:
+    workflows: ["CI", "Required quality"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ci-auto-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  auto-fix:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.pull_requests[0] != null &&
+      !startsWith(github.event.workflow_run.head_commit.message, 'fix(ci)')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Un intento por PR
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          if gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -qx 'ci-auto-fix'; then
+            echo "El PR #$PR ya tuvo su intento automático."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            gh label create ci-auto-fix --repo "$GITHUB_REPOSITORY" --color D93F0B \
+              --description "Claude intentó arreglar el CI de este PR" 2>/dev/null || true
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ci-auto-fix
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+          # La credencial que queda en .git/config es la que usa el push de Claude. Con el
+          # GITHUB_TOKEN del workflow el push sale como github-actions[bot] y el CI del PR pide
+          # aprobación manual; con la credencial de automatización sale como el dueño.
+          token: ${{ secrets.AUTOMATION_TOKEN }}
+
+      - name: Logs de los jobs que fallaron
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const runId = context.payload.workflow_run.id;
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner, repo: context.repo.repo, run_id: runId, per_page: 100 });
+            let out = '';
+            for (const job of jobs.filter(j => j.conclusion === 'failure')) {
+              const res = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                owner: context.repo.owner, repo: context.repo.repo, job_id: job.id });
+              const lines = String(res.data).split('\n');
+              out += `\n===== job: ${job.name} (últimas 200 líneas) =====\n` + lines.slice(-200).join('\n') + '\n';
+            }
+            fs.writeFileSync('ci-failure.log', out || 'Sin logs de jobs fallidos.');
+            core.info(`ci-failure.log: ${out.length} bytes`);
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Credencial de automatización (PAT), no GITHUB_TOKEN ni la app: lo que la app de
+          # Claude empuja queda atribuido a un bot sin permisos y el CI del PR pide aprobación
+          # manual (`action_required`); con el PAT los pushes disparan el CI y se fusionan.
+          github_token: ${{ secrets.AUTOMATION_TOKEN }}
+          # Y la autoría del commit también del dueño: la acción pone por defecto el correo de
+          # claude[bot], que GitHub atribuye a github-actions[bot], y ese actor dispara un CI que
+          # espera aprobación manual aunque el push lo haga el PAT.
+          bot_id: "7233165"
+          bot_name: "gonzalezulises"
+          allowed_bots: "dependabot[bot]"
+          prompt: |
+            El CI del PR #${{ github.event.workflow_run.pull_requests[0].number }} (rama
+            `${{ github.event.workflow_run.head_branch }}`) falló en el workflow
+            «${{ github.event.workflow_run.name }}». Los logs de los jobs fallidos están en
+            `ci-failure.log` (últimas 200 líneas de cada job).
+
+            1. Lee `AGENTS.md` y `ci-failure.log`; encuentra la causa raíz.
+            2. Corrige la causa, no el síntoma: no borres ni saltes tests, no desactives lint,
+               typecheck ni gates, no toques migraciones de base de datos.
+            3. Corre `make check`. Si no queda en verde, no empujes nada: comenta en el PR con
+               `gh pr comment` qué encontraste y qué falta, y termina.
+            4. Si queda en verde: commit `fix(ci): <qué se corrigió>` con el trailer
+               `Implemented-by: Claude Code (ci-auto-fix)` y
+               `git push origin HEAD:${{ github.event.workflow_run.head_branch }}`.
+          claude_args: '--max-turns 50 --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash(make:*),Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(git:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*)"'

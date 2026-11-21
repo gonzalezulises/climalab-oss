@@ -1,0 +1,43 @@
+name: Dependabot auto-merge
+
+# Patch y minor se fusionan solos cuando los checks requeridos del ruleset pasan.
+# Los majors esperan a una persona. Patrón documentado por GitHub
+# (docs.github.com → "Automating Dependabot with GitHub Actions").
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Metadatos del bump
+        id: md
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Activar auto-merge (patch y minor)
+        # Solo npm (fetch-metadata lo reporta como `npm_and_yarn`): un bump de una acción de
+        # terceros corre después con secretos de producción y merece ojos humanos aunque sea patch.
+        if: >-
+          contains(fromJSON('["npm","npm_and_yarn"]'), steps.md.outputs.package-ecosystem) &&
+          (steps.md.outputs.update-type == 'version-update:semver-patch' ||
+           steps.md.outputs.update-type == 'version-update:semver-minor')
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          # Un PAT fino (contents + pull-requests: write), no GITHUB_TOKEN: el merge hecho con
+          # GITHUB_TOKEN no dispara otros workflows, y en muchos repos el push a main es el deploy.
+          # Los workflows que dispara Dependabot leen los *secretos de Dependabot*, no los de
+          # Actions: el PAT se guarda con `gh secret set --app dependabot`.
+          GH_TOKEN: ${{ secrets.DEPENDABOT_AUTOMERGE_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::Falta DEPENDABOT_AUTOMERGE_TOKEN como secreto de Dependabot (gh secret set --app dependabot); sin él el auto-merge no se activa."
+            exit 0
+          fi
+          gh pr merge --auto --squash "$PR_URL"

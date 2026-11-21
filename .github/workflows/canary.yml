@@ -1,0 +1,65 @@
+name: Canary
+
+# El canario que se resuelve solo: cada hora pide la URL de producción. Tres fallos seguidos
+# abren (o actualizan) un issue `canary`; el primer éxito lo cierra con comentario. No depende
+# de seats de Sentry ni de nadie que lea alertas. Coste: ~2 min de runner al día.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: canary
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      URL: ${{ vars.CANARY_URL || 'https://climalab.vercel.app' }}
+      LABEL: canary
+    steps:
+      - name: Pedir la URL tres veces (una sola buena basta)
+        id: probe
+        run: |
+          ok=0; detail=""
+          for i in 1 2 3; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$URL" || echo 000)"
+            detail="$detail intento $i: HTTP $code;"
+            # 2xx/3xx = arriba; 401/403 = arriba detrás de la protección de Vercel; el resto, abajo.
+            if { [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; } || [ "$code" = 401 ] || [ "$code" = 403 ]; then ok=1; break; fi
+            sleep 20
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          echo "$URL →$detail"
+
+      - name: Abrir o actualizar el issue si falló
+        if: steps.probe.outputs.ok != '1'
+        run: |
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Producción no responde" 2>/dev/null || true
+          N="$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')"
+          MSG="Canario en rojo el $(date -u '+%Y-%m-%d %H:%M UTC'): \`$URL\` →${{ steps.probe.outputs.detail }} Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -n "$N" ]; then
+            gh issue comment "$N" --repo "$GITHUB_REPOSITORY" --body "$MSG"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
+              --title "Canario: producción no responde ($URL)" \
+              --body "$MSG"$'\n\n'"Se cierra solo cuando la URL vuelva a responder."
+          fi
+          exit 1
+
+      - name: Cerrar el issue si volvió
+        if: steps.probe.outputs.ok == '1'
+        run: |
+          for N in $(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --limit 20 --json number --jq '.[].number'); do
+            gh issue close "$N" --repo "$GITHUB_REPOSITORY" \
+              --comment "Canario en verde el $(date -u '+%Y-%m-%d %H:%M UTC'): \`$URL\` →${{ steps.probe.outputs.detail }}"
+          done
